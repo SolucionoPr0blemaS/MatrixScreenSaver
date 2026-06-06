@@ -1,0 +1,760 @@
+#include <windows.h>
+#include <windowsx.h>
+#include <commctrl.h>
+#include <vector>
+#include <string>
+#include <ctime>
+#include <cmath>
+
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "comdlg32.lib")
+
+// Desconexión de la librería nativa antigua de Windows para evitar conflictos de enlazado externo
+#pragma comment(linker, "/NODEFAULTLIB:scrnsave.lib")
+
+// --- STUBS OBLIGATORIOS PARA MANTENER LA COMPATIBILIDAD ---
+extern "C" {
+    LRESULT WINAPI ScreenSaverProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) { return DefWindowProcW(hWnd, msg, wp, lp); }
+    BOOL WINAPI ScreenSaverConfigureDialog(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) { return FALSE; }
+    BOOL WINAPI RegisterDialogClasses(HANDLE hInst) { return TRUE; }
+}
+
+// --- PARÁMETROS CONFIGURABLES CON VALORES POR DEFECTO ---
+int g_FontSize = 16;
+int g_Density = 250;
+int g_Speed = 25;
+int g_Multicolor = 0;
+int g_MulticolorLine = 0;
+int g_RandomSpeedCheck = 1;
+int g_Quality = 0;
+int g_MutateSpeed = 3;
+int g_MinLength = 15;
+int g_MaxLength = 40;
+int g_MutablePercent = 30;
+int g_ReduceGaps = 1;
+int g_MinRandomSpeed = 10;
+int g_MaxRandomSpeed = 150;
+int g_BrightPercent = 100;    // Control de porcentaje de letras iluminadas por defecto
+COLORREF g_BaseColor = RGB(0, 255, 0);
+wchar_t g_CharPoolStr[2048] = L"ｱ,ｲ,ｳ,ｴ,ｵ,ｶ,ｷ,ｸ,ｹ,ｺ,ｻ,ｼ,ｽ,ｾ,ｿ,ﾀ,ﾁ,ﾂ,ﾃ,ﾄ,ﾅ,ﾆ,ﾇ,ﾈ,ﾉ,ﾊ,ﾋ,ﾌ,ﾍ,ﾎ,ﾏ,ﾐ,ﾑ,ﾒ,ﾓ,ﾔ,ﾕ,ﾖ,ﾗ,ﾘ,ﾙ,ﾚ,ﾛ,ﾜ,ﾝ,\u20ac,0,1,2,3,4,5,6,7,8,9,$";
+
+// --- ESTRUCTURAS DEL SISTEMA ---
+struct Cell {
+    wchar_t glyph;
+    bool isFixed;
+};
+
+struct Chain {
+    int colIdx;
+    float headRow;
+    float speed;
+    int maxLength;
+    std::vector<Cell> gridRows;
+    int rainbowStart;
+    int cellCounter;
+
+    bool brightActive;
+    float brightRow;
+    float brightSpeed;
+};
+
+std::vector<Chain> chains;
+std::vector<bool> colOccupied;
+std::vector<wchar_t> charPool;
+
+POINT g_InitialMousePos;
+bool g_MouseInitialized = false;
+int g_MaxRows = 0;
+int g_MaxCols = 0;
+bool g_IsPreview = false;
+
+void UpdateCharPoolFromStr() {
+    charPool.clear();
+    std::wstring s(g_CharPoolStr);
+    size_t start = 0;
+    size_t end = s.find(L',');
+    while (end != std::wstring::npos) {
+        std::wstring token = s.substr(start, end - start);
+        if (!token.empty()) {
+            size_t first = token.find_first_not_of(L" ");
+            size_t last = token.find_last_not_of(L" ");
+            if (first != std::wstring::npos && last != std::wstring::npos) {
+                charPool.push_back(token.substr(first, (last - first + 1))[0]);
+            }
+        }
+        start = end + 1;
+        end = s.find(L',', start);
+    }
+    std::wstring token = s.substr(start);
+    if (!token.empty()) {
+        size_t first = token.find_first_not_of(L" ");
+        size_t last = token.find_last_not_of(L" ");
+        if (first != std::wstring::npos && last != std::wstring::npos) {
+            charPool.push_back(token.substr(first, (last - first + 1))[0]);
+        }
+    }
+    if (charPool.empty()) {
+        charPool.push_back(L'M');
+    }
+}
+
+COLORREF GetRainbowColor(int index) {
+    float frequency = 0.4f;
+    BYTE r = (BYTE)(sin(frequency * index + 0.0f) * 127 + 128);
+    BYTE g = (BYTE)(sin(frequency * index + 2.09439f) * 127 + 128);
+    BYTE b = (BYTE)(sin(frequency * index + 4.18879f) * 127 + 128);
+    return RGB(r, g, b);
+}
+
+void LoadSettings() {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\MatrixmioSaver", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD size = sizeof(DWORD);
+        DWORD val;
+        if (RegQueryValueExW(hKey, L"FontSize", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_FontSize = val;
+        if (RegQueryValueExW(hKey, L"Color", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_BaseColor = val;
+        if (RegQueryValueExW(hKey, L"Density", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_Density = val;
+        if (RegQueryValueExW(hKey, L"Speed", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_Speed = val;
+        if (RegQueryValueExW(hKey, L"Multicolor", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_Multicolor = val;
+        if (RegQueryValueExW(hKey, L"MulticolorLine", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_MulticolorLine = val;
+        if (RegQueryValueExW(hKey, L"RandomSpeed", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_RandomSpeedCheck = val;
+        if (RegQueryValueExW(hKey, L"Quality", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_Quality = val;
+        if (RegQueryValueExW(hKey, L"MutateSpeed", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_MutateSpeed = val;
+        if (RegQueryValueExW(hKey, L"MinLength", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_MinLength = val;
+        if (RegQueryValueExW(hKey, L"MaxLength", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_MaxLength = val;
+        if (RegQueryValueExW(hKey, L"MutablePercent", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_MutablePercent = val;
+        if (RegQueryValueExW(hKey, L"ReduceGaps", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_ReduceGaps = val;
+        if (RegQueryValueExW(hKey, L"MinRandomSpeed", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_MinRandomSpeed = val;
+        if (RegQueryValueExW(hKey, L"MaxRandomSpeed", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_MaxRandomSpeed = val;
+        if (RegQueryValueExW(hKey, L"BrightPercent", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_BrightPercent = val;
+
+        DWORD type = REG_SZ;
+        DWORD bytes = sizeof(g_CharPoolStr);
+        RegQueryValueExW(hKey, L"CharPoolStr", NULL, &type, (LPBYTE)g_CharPoolStr, &bytes);
+        RegCloseKey(hKey);
+    }
+    UpdateCharPoolFromStr();
+}
+
+void SaveSettings() {
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\MatrixmioSaver", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(hKey, L"FontSize", 0, REG_DWORD, (const BYTE*)&g_FontSize, sizeof(DWORD));
+        RegSetValueExW(hKey, L"Color", 0, REG_DWORD, (const BYTE*)&g_BaseColor, sizeof(DWORD));
+        RegSetValueExW(hKey, L"Density", 0, REG_DWORD, (const BYTE*)&g_Density, sizeof(DWORD));
+        RegSetValueExW(hKey, L"Speed", 0, REG_DWORD, (const BYTE*)&g_Speed, sizeof(DWORD));
+        RegSetValueExW(hKey, L"Multicolor", 0, REG_DWORD, (const BYTE*)&g_Multicolor, sizeof(DWORD));
+        RegSetValueExW(hKey, L"MulticolorLine", 0, REG_DWORD, (const BYTE*)&g_MulticolorLine, sizeof(DWORD));
+        RegSetValueExW(hKey, L"RandomSpeed", 0, REG_DWORD, (const BYTE*)&g_RandomSpeedCheck, sizeof(DWORD));
+        RegSetValueExW(hKey, L"Quality", 0, REG_DWORD, (const BYTE*)&g_Quality, sizeof(DWORD));
+        RegSetValueExW(hKey, L"MutateSpeed", 0, REG_DWORD, (const BYTE*)&g_MutateSpeed, sizeof(DWORD));
+        RegSetValueExW(hKey, L"MinLength", 0, REG_DWORD, (const BYTE*)&g_MinLength, sizeof(DWORD));
+        RegSetValueExW(hKey, L"MaxLength", 0, REG_DWORD, (const BYTE*)&g_MaxLength, sizeof(DWORD));
+        RegSetValueExW(hKey, L"MutablePercent", 0, REG_DWORD, (const BYTE*)&g_MutablePercent, sizeof(DWORD));
+        RegSetValueExW(hKey, L"ReduceGaps", 0, REG_DWORD, (const BYTE*)&g_ReduceGaps, sizeof(DWORD));
+        RegSetValueExW(hKey, L"MinRandomSpeed", 0, REG_DWORD, (const BYTE*)&g_MinRandomSpeed, sizeof(DWORD));
+        RegSetValueExW(hKey, L"MaxRandomSpeed", 0, REG_DWORD, (const BYTE*)&g_MaxRandomSpeed, sizeof(DWORD));
+        RegSetValueExW(hKey, L"BrightPercent", 0, REG_DWORD, (const BYTE*)&g_BrightPercent, sizeof(DWORD));
+        RegSetValueExW(hKey, L"CharPoolStr", 0, REG_SZ, (const BYTE*)g_CharPoolStr, (DWORD)((wcslen(g_CharPoolStr) + 1) * sizeof(wchar_t)));
+        RegCloseKey(hKey);
+    }
+}
+
+void ResetChain(Chain& c) {
+    if (c.colIdx != -1 && c.colIdx < (int)colOccupied.size()) {
+        colOccupied[c.colIdx] = false;
+    }
+
+    int chosenCol = rand() % g_MaxCols;
+    if (!g_RandomSpeedCheck) {
+        for (int i = 0; i < g_MaxCols; ++i) {
+            int testCol = (chosenCol + i) % g_MaxCols;
+            if (!colOccupied[testCol]) {
+                chosenCol = testCol;
+                break;
+            }
+        }
+        colOccupied[chosenCol] = true;
+    }
+
+    c.colIdx = chosenCol;
+    c.rainbowStart = rand() % 500;
+
+    if (g_MaxRows <= 6) g_MaxRows = 7;
+
+    if (g_MaxLength < g_MinLength) g_MaxLength = g_MinLength;
+    c.maxLength = g_MinLength + (rand() % (g_MaxLength - g_MinLength + 1));
+
+    if (g_ReduceGaps) {
+        c.headRow = (float)(-(rand() % (g_MaxRows / 3 + 1)));
+    }
+    else {
+        c.headRow = (float)(-(rand() % g_MaxRows));
+    }
+
+    int effectiveSpeedSetting = g_Speed;
+    if (g_RandomSpeedCheck) {
+        int minS = g_MinRandomSpeed;
+        int maxS = g_MaxRandomSpeed;
+        if (maxS < minS) maxS = minS;
+        effectiveSpeedSetting = minS + (rand() % (maxS - minS + 1));
+    }
+    c.speed = ((float)effectiveSpeedSetting / 45.0f) * 0.75f + ((rand() % 8) * 0.02f);
+
+    c.cellCounter = 0;
+    c.gridRows.assign(g_MaxRows, { L' ', true });
+
+    c.brightActive = (rand() % 100 < g_BrightPercent);
+    // Comienza estrictamente a partir del 5º por el final (evitando los 4 de atenuación)
+    c.brightRow = (float)((int)c.headRow - c.maxLength + 4);
+    // Multiplicador acotado de forma segura entre un mínimo de 2.5x y un máximo de 4x (15 * 0.1 = 1.5)
+    float speedMultiplier = 2.5f + ((rand() % 16) * 0.1f);
+    c.brightSpeed = c.speed * speedMultiplier;
+}
+
+LRESULT CALLBACK ScreenSaverWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        srand((unsigned int)time(NULL));
+        LoadSettings();
+
+        RECT rcClient;
+        GetClientRect(hWnd, &rcClient);
+        int width = rcClient.right - rcClient.left;
+        int height = rcClient.bottom - rcClient.top;
+
+        int runtimeFontSize = g_FontSize;
+        if (g_IsPreview && runtimeFontSize > 8) {
+            runtimeFontSize = 8;
+        }
+
+        g_MaxCols = width / runtimeFontSize;
+        g_MaxRows = height / (runtimeFontSize + 4);
+        if (g_MaxCols <= 0) g_MaxCols = 1;
+        if (g_MaxRows <= 0) g_MaxRows = 1;
+
+        colOccupied.assign(g_MaxCols, false);
+
+        int dynamicDensity = g_Density;
+        if (g_IsPreview) dynamicDensity = 35;
+        if (dynamicDensity > g_MaxCols && !g_RandomSpeedCheck) dynamicDensity = g_MaxCols;
+
+        chains.resize(dynamicDensity);
+        for (int i = 0; i < dynamicDensity; ++i) {
+            chains[i].colIdx = -1;
+            ResetChain(chains[i]);
+            chains[i].headRow = (float)(rand() % g_MaxRows) - (rand() % g_MaxRows);
+
+            int currentHead = (int)chains[i].headRow;
+            int currentTail = currentHead - chains[i].maxLength;
+            if (chains[i].maxLength > 0 && chains[i].brightActive) {
+                // Posicionamiento inicial aleatorio respetando la restricción de los 4 últimos caracteres
+                int availableRange = chains[i].maxLength - 3;
+                if (availableRange < 1) availableRange = 1;
+                chains[i].brightRow = (float)(currentTail + 4 + (rand() % availableRange));
+            }
+        }
+
+        SetTimer(hWnd, 1, 16, NULL);
+        return 0;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        int width = rc.right - rc.left;
+        int height = rc.bottom - rc.top;
+
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBitmap = CreateCompatibleBitmap(hdc, width, height);
+        HBITMAP hOldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
+
+        BYTE targetQuality = CLEARTYPE_QUALITY;
+        LPCWSTR targetFontFamily = L"Meiryo";
+
+        if (g_Quality == 0) {
+            targetQuality = NONANTIALIASED_QUALITY;
+            targetFontFamily = L"MS Gothic";
+        }
+        else if (g_Quality == 1) {
+            targetQuality = ANTIALIASED_QUALITY;
+        }
+
+        int runtimeFontSize = g_FontSize;
+        if (g_IsPreview && runtimeFontSize > 8) runtimeFontSize = 8;
+
+        HFONT hFont = CreateFontW(runtimeFontSize, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            SHIFTJIS_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, targetQuality,
+            DEFAULT_PITCH | FF_DONTCARE, targetFontFamily);
+        HFONT hOldFont = (HFONT)SelectObject(memDC, hFont);
+
+        HBRUSH hBlack = CreateSolidBrush(RGB(0, 0, 0));
+        FillRect(memDC, &rc, hBlack);
+        DeleteObject(hBlack);
+
+        for (const auto& ch : chains) {
+            int currentHead = (int)ch.headRow;
+            int currentTail = currentHead - ch.maxLength;
+            int posX = ch.colIdx * runtimeFontSize;
+
+            XFORM xForm = { -1.0f, 0.0f, 0.0f, 1.0f, (float)posX + runtimeFontSize, 0.0f };
+            SetGraphicsMode(memDC, GM_ADVANCED);
+            SetWorldTransform(memDC, &xForm);
+
+            for (int r = 0; r < g_MaxRows; ++r) {
+                if (r >= currentTail && r <= currentHead) {
+                    if (r < 0 || r >= (int)ch.gridRows.size() || ch.gridRows[r].glyph == L' ' || ch.gridRows[r].glyph == 0) continue;
+
+                    int posY = r * (runtimeFontSize + 4);
+                    int alphaDeduction = 0;
+                    if (r == currentTail)          alphaDeduction = 210;
+                    else if (r == currentTail + 1) alphaDeduction = 150;
+                    else if (r == currentTail + 2) alphaDeduction = 90;
+                    else if (r == currentTail + 3) alphaDeduction = 40;
+
+                    // Restricción estricta: los destellos brillantes solo se renderizan a partir del 5º por el final (r >= currentTail + 4)
+                    bool checkBright = (ch.brightActive && r <= (int)ch.brightRow && r > (int)ch.brightRow - 2 && r >= (currentTail + 4));
+
+                    if (checkBright) {
+                        COLORREF baseColorHalo = g_BaseColor;
+                        if (g_Multicolor) baseColorHalo = GetRainbowColor(ch.rainbowStart + r);
+                        else if (g_MulticolorLine) baseColorHalo = GetRainbowColor(ch.colIdx * 8);
+
+                        BYTE hr = (GetRValue(baseColorHalo) + 255) / 2;
+                        BYTE hg = (GetGValue(baseColorHalo) + 255) / 2;
+                        BYTE hb = (GetBValue(baseColorHalo) + 255) / 2;
+
+                        SetBkColor(memDC, RGB(0, 0, 0));
+                        SetBkMode(memDC, OPAQUE);
+                        SetTextColor(memDC, RGB(hr, hg, hb));
+                        TextOutW(memDC, -1, posY, &ch.gridRows[r].glyph, 1);
+
+                        SetBkMode(memDC, TRANSPARENT);
+                        TextOutW(memDC, 1, posY, &ch.gridRows[r].glyph, 1);
+                        TextOutW(memDC, 0, posY - 1, &ch.gridRows[r].glyph, 1);
+                        TextOutW(memDC, 0, posY + 1, &ch.gridRows[r].glyph, 1);
+
+                        SetTextColor(memDC, RGB(255, 255, 255));
+                        TextOutW(memDC, 0, posY, &ch.gridRows[r].glyph, 1);
+                    }
+                    else {
+                        COLORREF finalColor = g_BaseColor;
+                        if (g_Multicolor) finalColor = GetRainbowColor(ch.rainbowStart + r);
+                        else if (g_MulticolorLine) finalColor = GetRainbowColor(ch.colIdx * 8);
+
+                        BYTE red = GetRValue(finalColor);
+                        BYTE green = GetGValue(finalColor);
+                        BYTE blue = GetBValue(finalColor);
+
+                        red = (red > alphaDeduction) ? red - alphaDeduction : 0;
+                        green = (green > alphaDeduction) ? green - alphaDeduction : 0;
+                        blue = (blue > alphaDeduction) ? blue - alphaDeduction : 0;
+
+                        SetTextColor(memDC, RGB(red, green, blue));
+                        SetBkColor(memDC, RGB(0, 0, 0));
+                        SetBkMode(memDC, OPAQUE);
+                        TextOutW(memDC, 0, posY, &ch.gridRows[r].glyph, 1);
+                    }
+                }
+            }
+            ModifyWorldTransform(memDC, NULL, MWT_IDENTITY);
+        }
+
+        BitBlt(hdc, 0, 0, width, height, memDC, 0, 0, SRCCOPY);
+
+        SelectObject(memDC, hOldFont);
+        DeleteObject(hFont);
+        SelectObject(memDC, hOldBitmap);
+        DeleteObject(memBitmap);
+        DeleteDC(memDC);
+
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    case WM_TIMER: {
+        if (charPool.empty()) UpdateCharPoolFromStr();
+
+        for (auto& ch : chains) {
+            float prevHead = ch.headRow;
+            ch.headRow += ch.speed;
+
+            int prevHeadInt = (int)prevHead;
+            int currentHeadInt = (int)ch.headRow;
+
+            if (currentHeadInt > prevHeadInt) {
+                for (int r = prevHeadInt + 1; r <= currentHeadInt; ++r) {
+                    if (r >= 0 && r < g_MaxRows) {
+                        ch.cellCounter++;
+                        ch.gridRows[r].glyph = charPool[rand() % charPool.size()];
+                        ch.gridRows[r].isFixed = (rand() % 100 >= g_MutablePercent);
+                    }
+                }
+
+                int currentTailInt = currentHeadInt - ch.maxLength;
+                for (int r = 0; r < g_MaxRows; ++r) {
+                    if (r >= currentTailInt && r <= currentHeadInt) {
+                        if (r >= 0 && r < g_MaxRows) {
+                            bool isTailFade = (r >= currentTailInt && r < currentTailInt + 4);
+                            if (!ch.gridRows[r].isFixed || isTailFade) {
+                                ch.gridRows[r].glyph = charPool[rand() % charPool.size()];
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (currentHeadInt >= 0 && currentHeadInt < g_MaxRows) {
+                for (int r = currentHeadInt - ch.maxLength; r <= currentHeadInt; ++r) {
+                    if (r >= 0 && r < g_MaxRows && !ch.gridRows[r].isFixed) {
+                        if (rand() % 100 < g_MutateSpeed) {
+                            ch.gridRows[r].glyph = charPool[rand() % charPool.size()];
+                        }
+                    }
+                }
+            }
+
+            if (ch.brightActive) {
+                ch.brightRow += ch.brightSpeed;
+
+                if (ch.brightRow > ch.headRow + 2) {
+                    if (rand() % 100 < g_BrightPercent) {
+                        // Al reciclar el destello, se salta los 4 primeros caracteres transparentes del inicio de cola
+                        ch.brightRow = (float)(currentHeadInt - ch.maxLength + 4);
+                        float speedMultiplier = 2.5f + ((rand() % 16) * 0.1f);
+                        ch.brightSpeed = ch.speed * speedMultiplier;
+                    }
+                    else {
+                        ch.brightActive = false;
+                    }
+                }
+            }
+
+            if ((currentHeadInt - ch.maxLength) >= g_MaxRows) {
+                ResetChain(ch);
+            }
+        }
+
+        InvalidateRect(hWnd, NULL, FALSE);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (g_IsPreview) return 0;
+        int mX = GET_X_LPARAM(lp);
+        int mY = GET_Y_LPARAM(lp);
+        if (!g_MouseInitialized) {
+            g_InitialMousePos.x = mX;
+            g_InitialMousePos.y = mY;
+            g_MouseInitialized = true;
+        }
+        else if (std::abs(mX - g_InitialMousePos.x) > 15 || std::abs(mY - g_InitialMousePos.y) > 15) {
+            PostQuitMessage(0);
+        }
+        return 0;
+    }
+    case WM_KEYDOWN:
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+    case WM_SYSKEYDOWN:
+        if (!g_IsPreview) PostQuitMessage(0);
+        return 0;
+    case WM_DESTROY:
+        KillTimer(hWnd, 1);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wp, lp);
+}
+
+// --- MENÚ DE CONFIGURACIÓN DINÁMICO ---
+LRESULT CALLBACK ConfigWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
+    static HWND hFontTrack, hDensityTrack, hSpeedTrack, hQualityTrack, hMutateTrack, hMutableTrack, hMinLenTrack, hMaxLenTrack, hBrightTrack, hCharEdit;
+    static HWND hMulticolorCheck, hMulticolorLineCheck, hRandomSpeedCheck, hReduceGapsCheck;
+    static HWND hMinRandomLabel, hMinRandomTrack, hMaxRandomLabel, hMaxRandomTrack, hCharLabel, hOkButton, hCancelButton;
+    static HFONT hDialogFont = NULL;
+
+    auto UpdateConfigLayout = [=](HWND hWindow) {
+        bool isChecked = (SendMessageW(hRandomSpeedCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        int shift = isChecked ? 110 : 0;
+        int showCmd = isChecked ? SW_SHOW : SW_HIDE;
+
+        ShowWindow(hMinRandomLabel, showCmd);
+        ShowWindow(hMinRandomTrack, showCmd);
+        ShowWindow(hMaxRandomLabel, showCmd);
+        ShowWindow(hMaxRandomTrack, showCmd);
+
+        SetWindowPos(hCharLabel, NULL, 25, 610 + shift, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+        SetWindowPos(hCharEdit, NULL, 25, 630 + shift, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+        SetWindowPos(hOkButton, NULL, 45, 740 + shift, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+        SetWindowPos(hCancelButton, NULL, 175, 740 + shift, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+
+        SetWindowPos(hWindow, NULL, 0, 0, 350, 830 + shift, SWP_NOMOVE | SWP_NOZORDER);
+        };
+
+    switch (msg) {
+    case WM_CREATE: {
+        hDialogFont = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+            DEFAULT_PITCH | FF_DONTCARE, L"Meiryo");
+
+        HWND hCtrl;
+
+        hCtrl = CreateWindowW(L"STATIC", L"Tama\u00f1o de Letra (P\u00edxeles):", WS_CHILD | WS_VISIBLE, 25, 10, 280, 20, hWnd, NULL, NULL, NULL);
+        SendMessageW(hCtrl, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+        hFontTrack = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS, 20, 28, 280, 30, hWnd, NULL, NULL, NULL);
+        SendMessageW(hFontTrack, TBM_SETRANGE, TRUE, MAKELPARAM(6, 48));
+        SendMessageW(hFontTrack, TBM_SETPOS, TRUE, g_FontSize);
+
+        hCtrl = CreateWindowW(L"STATIC", L"Densidad de Cadenas (M\u00e1x Ampliado x2):", WS_CHILD | WS_VISIBLE, 25, 65, 280, 20, hWnd, NULL, NULL, NULL);
+        SendMessageW(hCtrl, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+        hDensityTrack = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS, 20, 83, 280, 30, hWnd, NULL, NULL, NULL);
+        SendMessageW(hDensityTrack, TBM_SETRANGE, TRUE, MAKELPARAM(10, 5000));
+        SendMessageW(hDensityTrack, TBM_SETPOS, TRUE, g_Density);
+
+        hCtrl = CreateWindowW(L"STATIC", L"Velocidad de Ca\u00dda (L\u00edmites 1/5 del Total):", WS_CHILD | WS_VISIBLE, 25, 120, 280, 20, hWnd, NULL, NULL, NULL);
+        SendMessageW(hCtrl, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+        hSpeedTrack = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS, 20, 138, 280, 30, hWnd, NULL, NULL, NULL);
+        SendMessageW(hSpeedTrack, TBM_SETRANGE, TRUE, MAKELPARAM(1, 200));
+        SendMessageW(hSpeedTrack, TBM_SETPOS, TRUE, g_Speed);
+
+        hCtrl = CreateWindowW(L"STATIC", L"Calidad Gr\u00e1fica (Baja - Media - Alta):", WS_CHILD | WS_VISIBLE, 25, 175, 280, 20, hWnd, NULL, NULL, NULL);
+        SendMessageW(hCtrl, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+        hQualityTrack = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS, 20, 193, 280, 30, hWnd, NULL, NULL, NULL);
+        SendMessageW(hQualityTrack, TBM_SETRANGE, TRUE, MAKELPARAM(0, 2));
+        SendMessageW(hQualityTrack, TBM_SETPOS, TRUE, g_Quality);
+
+        hCtrl = CreateWindowW(L"STATIC", L"Velocidad de cambio (Mutaci\u00f3n eslabones):", WS_CHILD | WS_VISIBLE, 25, 230, 280, 20, hWnd, NULL, NULL, NULL);
+        SendMessageW(hCtrl, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+        hMutateTrack = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS, 20, 248, 280, 30, hWnd, NULL, NULL, NULL);
+        SendMessageW(hMutateTrack, TBM_SETRANGE, TRUE, MAKELPARAM(1, 10));
+        SendMessageW(hMutateTrack, TBM_SETPOS, TRUE, g_MutateSpeed);
+
+        hCtrl = CreateWindowW(L"STATIC", L"Cantidad de eslabones mutables (%):", WS_CHILD | WS_VISIBLE, 25, 285, 280, 20, hWnd, NULL, NULL, NULL);
+        SendMessageW(hCtrl, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+        hMutableTrack = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS, 20, 303, 280, 30, hWnd, NULL, NULL, NULL);
+        SendMessageW(hMutableTrack, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+        SendMessageW(hMutableTrack, TBM_SETPOS, TRUE, g_MutablePercent);
+
+        hCtrl = CreateWindowW(L"STATIC", L"Longitud M\u00ednima de Cadena:", WS_CHILD | WS_VISIBLE, 25, 340, 280, 20, hWnd, NULL, NULL, NULL);
+        SendMessageW(hMinLenTrack, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+        hMinLenTrack = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS, 20, 358, 280, 30, hWnd, NULL, NULL, NULL);
+        SendMessageW(hMinLenTrack, TBM_SETRANGE, TRUE, MAKELPARAM(2, 100));
+        SendMessageW(hMinLenTrack, TBM_SETPOS, TRUE, g_MinLength);
+
+        hCtrl = CreateWindowW(L"STATIC", L"Longitud M\u00e1xima de Cadena:", WS_CHILD | WS_VISIBLE, 25, 395, 280, 20, hWnd, NULL, NULL, NULL);
+        SendMessageW(hCtrl, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+        hMaxLenTrack = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS, 20, 413, 280, 30, hWnd, NULL, NULL, NULL);
+        SendMessageW(hMaxLenTrack, TBM_SETRANGE, TRUE, MAKELPARAM(2, 100));
+        SendMessageW(hMaxLenTrack, TBM_SETPOS, TRUE, g_MaxLength);
+
+        hCtrl = CreateWindowW(L"BUTTON", L"Cambiar Color Base", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 25, 455, 280, 30, hWnd, (HMENU)201, NULL, NULL);
+        SendMessageW(hCtrl, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+
+        hCtrl = CreateWindowW(L"STATIC", L"Cantidad de letras iluminadas (%):", WS_CHILD | WS_VISIBLE, 25, 495, 280, 20, hWnd, NULL, NULL, NULL);
+        SendMessageW(hCtrl, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+        hBrightTrack = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS, 20, 513, 280, 30, hWnd, NULL, NULL, NULL);
+        SendMessageW(hBrightTrack, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+        SendMessageW(hBrightTrack, TBM_SETPOS, TRUE, g_BrightPercent);
+
+        // Fila 1 - Columna 1
+        hMulticolorCheck = CreateWindowW(L"BUTTON", L"Multicolor letra", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 25, 555, 140, 20, hWnd, (HMENU)202, NULL, NULL);
+        SendMessageW(hMulticolorCheck, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+        SendMessageW(hMulticolorCheck, BM_SETCHECK, g_Multicolor ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        // Fila 1 - Columna 2
+        hMulticolorLineCheck = CreateWindowW(L"BUTTON", L"Multicolor linea", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 170, 555, 140, 20, hWnd, (HMENU)204, NULL, NULL);
+        SendMessageW(hMulticolorLineCheck, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+        SendMessageW(hMulticolorLineCheck, BM_SETCHECK, g_MulticolorLine ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        // Fila 2 - Columna 1
+        hRandomSpeedCheck = CreateWindowW(L"BUTTON", L"Velocidad Aleatoria", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 25, 580, 140, 20, hWnd, (HMENU)203, NULL, NULL);
+        SendMessageW(hRandomSpeedCheck, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+        SendMessageW(hRandomSpeedCheck, BM_SETCHECK, g_RandomSpeedCheck ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        // Fila 2 - Columna 2
+        hReduceGapsCheck = CreateWindowW(L"BUTTON", L"No espacios", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 170, 580, 140, 20, hWnd, NULL, NULL, NULL);
+        SendMessageW(hReduceGapsCheck, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+        SendMessageW(hReduceGapsCheck, BM_SETCHECK, g_ReduceGaps ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        hMinRandomLabel = CreateWindowW(L"STATIC", L"Velocidad m\u00ednima aleatoria:", WS_CHILD, 25, 610, 280, 20, hWnd, NULL, NULL, NULL);
+        SendMessageW(hMinRandomLabel, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+        hMinRandomTrack = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | TBS_AUTOTICKS, 20, 628, 280, 30, hWnd, NULL, NULL, NULL);
+        SendMessageW(hMinRandomTrack, TBM_SETRANGE, TRUE, MAKELPARAM(1, 200));
+        SendMessageW(hMinRandomTrack, TBM_SETPOS, TRUE, g_MinRandomSpeed);
+
+        hMaxRandomLabel = CreateWindowW(L"STATIC", L"Velocidad m\u00e1xima aleatoria:", WS_CHILD, 25, 665, 280, 20, hWnd, NULL, NULL, NULL);
+        SendMessageW(hMaxRandomLabel, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+        hMaxRandomTrack = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | TBS_AUTOTICKS, 20, 683, 280, 30, hWnd, NULL, NULL, NULL);
+        SendMessageW(hMaxRandomTrack, TBM_SETRANGE, TRUE, MAKELPARAM(1, 200));
+        SendMessageW(hMaxRandomTrack, TBM_SETPOS, TRUE, g_MaxRandomSpeed);
+
+        hCharLabel = CreateWindowW(L"STATIC", L"Caracteres de la matriz (Separa por comas):", WS_CHILD | WS_VISIBLE, 25, 610, 280, 20, hWnd, NULL, NULL, NULL);
+        SendMessageW(hCharLabel, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+
+        hCharEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", g_CharPoolStr,
+            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_WANTRETURN,
+            25, 630, 280, 95, hWnd, NULL, NULL, NULL);
+        SendMessageW(hCharEdit, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+
+        hOkButton = CreateWindowW(L"BUTTON", L"Guardar", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 45, 740, 100, 32, hWnd, (HMENU)IDOK, NULL, NULL);
+        SendMessageW(hOkButton, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+
+        hCancelButton = CreateWindowW(L"BUTTON", L"Cancelar", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 175, 740, 100, 32, hWnd, (HMENU)IDCANCEL, NULL, NULL);
+        SendMessageW(hCancelButton, WM_SETFONT, (WPARAM)hDialogFont, TRUE);
+
+        UpdateConfigLayout(hWnd);
+        return 0;
+    }
+    case WM_COMMAND: {
+        if (LOWORD(wp) == 202) {
+            if (SendMessageW(hMulticolorCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+                SendMessageW(hMulticolorLineCheck, BM_SETCHECK, BST_UNCHECKED, 0);
+            }
+        }
+        else if (LOWORD(wp) == 204) {
+            if (SendMessageW(hMulticolorLineCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+                SendMessageW(hMulticolorCheck, BM_SETCHECK, BST_UNCHECKED, 0);
+            }
+        }
+        else if (LOWORD(wp) == 203) {
+            UpdateConfigLayout(hWnd);
+        }
+        else if (LOWORD(wp) == 201) {
+            CHOOSECOLORW cc = { 0 };
+            static COLORREF custColors[16];
+            cc.lStructSize = sizeof(cc);
+            cc.hwndOwner = hWnd;
+            cc.lpCustColors = (LPDWORD)custColors;
+            cc.rgbResult = g_BaseColor;
+            cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+            if (ChooseColorW(&cc)) {
+                g_BaseColor = cc.rgbResult;
+            }
+        }
+        else if (LOWORD(wp) == IDOK) {
+            g_FontSize = (int)SendMessageW(hFontTrack, TBM_GETPOS, 0, 0);
+            g_Density = (int)SendMessageW(hDensityTrack, TBM_GETPOS, 0, 0);
+            g_Speed = (int)SendMessageW(hSpeedTrack, TBM_GETPOS, 0, 0);
+            g_Quality = (int)SendMessageW(hQualityTrack, TBM_GETPOS, 0, 0);
+            g_MutateSpeed = (int)SendMessageW(hMutateTrack, TBM_GETPOS, 0, 0);
+            g_MutablePercent = (int)SendMessageW(hMutableTrack, TBM_GETPOS, 0, 0);
+            g_MinLength = (int)SendMessageW(hMinLenTrack, TBM_GETPOS, 0, 0);
+            g_MaxLength = (int)SendMessageW(hMaxLenTrack, TBM_GETPOS, 0, 0);
+            g_MinRandomSpeed = (int)SendMessageW(hMinRandomTrack, TBM_GETPOS, 0, 0);
+            g_MaxRandomSpeed = (int)SendMessageW(hMaxRandomTrack, TBM_GETPOS, 0, 0);
+            g_BrightPercent = (int)SendMessageW(hBrightTrack, TBM_GETPOS, 0, 0);
+
+            if (g_MaxLength < g_MinLength) g_MaxLength = g_MinLength;
+            if (g_MaxRandomSpeed < g_MinRandomSpeed) g_MaxRandomSpeed = g_MinRandomSpeed;
+
+            GetWindowTextW(hCharEdit, g_CharPoolStr, 2048);
+
+            g_Multicolor = (SendMessageW(hMulticolorCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+            g_MulticolorLine = (SendMessageW(hMulticolorLineCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+            g_RandomSpeedCheck = (SendMessageW(hRandomSpeedCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+            g_ReduceGaps = (SendMessageW(hReduceGapsCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+
+            SaveSettings();
+            EndDialog(hWnd, IDOK);
+            DestroyWindow(hWnd);
+        }
+        else if (LOWORD(wp) == IDCANCEL) {
+            EndDialog(hWnd, IDCANCEL);
+            DestroyWindow(hWnd);
+        }
+        return 0;
+    }
+    case WM_DESTROY:
+        if (hDialogFont) DeleteObject(hDialogFont);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wp, lp);
+}
+
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
+    LoadSettings();
+    InitCommonControls();
+
+    std::string arguments = cmd ? cmd : "";
+    HWND hParentWnd = NULL;
+
+    size_t pPos = arguments.find("/p");
+    if (pPos == std::string::npos) pPos = arguments.find("/P");
+    if (pPos == std::string::npos) pPos = arguments.find("-p");
+    if (pPos == std::string::npos) pPos = arguments.find("-P");
+
+    if (pPos != std::string::npos) {
+        g_IsPreview = true;
+        std::string hwndStr = "";
+        size_t idx = pPos + 2;
+        while (idx < arguments.size() && (arguments[idx] == ' ' || arguments[idx] == ':')) {
+            idx++;
+        }
+        while (idx < arguments.size() && isdigit((unsigned char)arguments[idx])) {
+            hwndStr += arguments[idx];
+            idx++;
+        }
+        if (!hwndStr.empty()) {
+            hParentWnd = (HWND)(ULONG_PTR)std::stoull(hwndStr);
+        }
+    }
+
+    if (!arguments.empty() && (arguments.find("/c") == 0 || arguments.find("/C") == 0 || hParentWnd == NULL && g_IsPreview == false && arguments.find("/s") == std::string::npos && arguments.find("/S") == std::string::npos)) {
+        WNDCLASSW wcc = { 0 };
+        wcc.lpfnWndProc = (WNDPROC)ConfigWndProc;
+        wcc.hInstance = hInst;
+        wcc.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
+        wcc.lpszClassName = L"MatrixConfigWindow";
+        RegisterClassW(&wcc);
+
+        int winWidth = 350;
+        int winHeight = g_RandomSpeedCheck ? 940 : 830;
+        int scrWidth = GetSystemMetrics(SM_CXSCREEN);
+        int scrHeight = GetSystemMetrics(SM_CYSCREEN);
+        int posX = (scrWidth - winWidth) / 2;
+        int posY = (scrHeight - winHeight) / 2;
+
+        HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"MatrixConfigWindow", L"Propiedades de Matrixmio",
+            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            posX, posY, winWidth, winHeight, NULL, NULL, hInst, NULL);
+
+        ShowWindow(hDlg, SW_SHOW);
+        MSG msg;
+        while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+        return 0;
+    }
+
+    WNDCLASSW wc = { 0 };
+    wc.lpfnWndProc = ScreenSaverWndProc;
+    wc.hInstance = hInst;
+    wc.hCursor = NULL;
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.lpszClassName = L"MatrixSaverGraphics";
+    RegisterClassW(&wc);
+
+    HWND hwnd;
+    if (g_IsPreview && hParentWnd != NULL) {
+        RECT parentRect;
+        GetClientRect(hParentWnd, &parentRect);
+        hwnd = CreateWindowExW(0, L"MatrixSaverGraphics", L"", WS_CHILD | WS_VISIBLE,
+            0, 0, parentRect.right - parentRect.left, parentRect.bottom - parentRect.top,
+            hParentWnd, NULL, hInst, NULL);
+    }
+    else {
+        hwnd = CreateWindowExW(WS_EX_TOPMOST, L"MatrixSaverGraphics", L"", WS_POPUP | WS_VISIBLE,
+            GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN), NULL, NULL, hInst, NULL);
+        ShowCursor(FALSE);
+    }
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) { DispatchMessage(&msg); }
+
+    if (!g_IsPreview) ShowCursor(TRUE);
+    return 0;
+}
