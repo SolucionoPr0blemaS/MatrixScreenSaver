@@ -27,11 +27,11 @@ Algorithm       Hash                                                            
 SHA256          E1F6DF3AE61F24B13D5B0156A63032683B689890362AC8E50D02567D37D15464       C:\Users\MatrixmioEN.scr
 
 
-**************************
-*                        *
-*       NEW UPDATE       *
-*                        *
-**************************
+--------------------------
+-                        -
+-       NEW UPDATE       -
+-                        -
+--------------------------
 
 Add Multilingual Suport
 English, French, Spanish, Rusian, deutch and japanese
@@ -48,3 +48,7 @@ Add maximum measure of chains
 Algorithm       Hash                                                                   Path
 ---------       ----                                                                   ----
 SHA256          BD5C6D6BB2C55916A24DEF034973F0F83001E406E1402AF4ECA75B6C12C65905
+
+Compiling line
+
+cl /EHsc /DUNICODE /D_UNICODE Matrix3D.cpp /link /OUT:Matrix3D.scr /SUBSYSTEM:WINDOWS /DEFAULTLIB:User32.lib /DEFAULTLIB:Gdi32.lib /DEFAULTLIB:Advapi32.lib /DEFAULTLIB:Comctl32.lib /DEFAULTLIB:Comdlg32.lib
